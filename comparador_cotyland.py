@@ -10,7 +10,7 @@ from pathlib import Path
 from datetime import datetime
 
 APP_TITLE = 'Cotyland | Comparador de Precios y Etiquetas'
-APP_VERSION = '7.0.0'
+APP_VERSION = '7.1.0'
 
 
 def money(value):
@@ -143,7 +143,7 @@ class App(tk.Tk):
                 if messagebox.askyesno('Actualización instalada',
                         'Se instaló la versión ' + result['version'] + '.\n\n¿Reiniciar el programa ahora?'):
                     self.destroy()
-                    subprocess.Popen([sys.executable, str(Path(__file__).resolve())], cwd=str(Path(__file__).resolve().parent))
+                    subprocess.Popen([str(Path(sys.executable).with_name('pythonw.exe')) if sys.platform == 'win32' and Path(sys.executable).with_name('pythonw.exe').exists() else sys.executable, str(Path(__file__).resolve())], cwd=str(Path(__file__).resolve().parent))
         except Exception as exc:
             messagebox.showerror('No se pudo actualizar', str(exc) +
                 '\n\nPodés cambiar la dirección editando actualizaciones.json junto al programa.')
@@ -328,27 +328,24 @@ class App(tk.Tk):
                 for n, line in enumerate(lines):
                     c.drawCentredString(x+w/2, y+h-(3.8+n*3.3)*mm, line)
 
-                # Precio con prioridad máxima. Objetivo 94 pt (doble que V5).
-                # El alto de 35 mm impone un límite físico de 70 pt, y los
-                # precios largos se reducen hasta entrar dentro de los 70 mm.
-                # Los importes enteros se imprimen sin ,00 para ganar espacio.
+                # Precio protagonista: sin barras, centrado y siempre dentro de la etiqueta.
+                # El tamaño máximo real depende del ancho de los 70 mm.
                 price = display_money(product['price'])
-                target_size = 94.0
-                vertical_limit = 70.0
-                max_price_width = w - 1.5*mm
-                size = min(target_size, vertical_limit)
-                width_at_size = stringWidth(price, 'Helvetica-Bold', size)
-                if width_at_size > max_price_width:
-                    size *= max_price_width / width_at_size
+                max_price_width = w - 4*mm
+                desired_size = 48.0
+                size = min(desired_size, desired_size * max_price_width /
+                           max(stringWidth(price, 'Helvetica-Bold', desired_size), 1))
                 c.setFont('Helvetica-Bold', size)
-                c.drawCentredString(x+w/2, y+10.5*mm, price)
+                # Línea de precio entre la descripción y el código numérico.
+                c.drawCentredString(x+w/2, y+12.0*mm, price)
 
-                # Número de artículo legible, sin representación en barras.
+                # Código exclusivamente numérico, sin barras ni fuente de barcode.
                 identifier = str(product['code']).strip()
-                c.setFont('Helvetica-Bold', 8.2)
-                c.drawCentredString(x+w/2, y+6.0*mm, clip('Cód. art.: ' + identifier, 'Helvetica-Bold', 8.2, w-4*mm))
+                c.setFont('Helvetica-Bold', 10.0)
+                c.drawCentredString(x+w/2, y+5.1*mm,
+                    clip('Cód. art.: ' + identifier, 'Helvetica-Bold', 10.0, w-4*mm))
                 c.setFont('Helvetica', 7.0)
-                c.drawCentredString(x+w/2, y+2.3*mm, 'Actualizado: ' + generated_date)
+                c.drawCentredString(x+w/2, y+1.9*mm, 'Actualizado: ' + generated_date)
                 index += 1
         c.save()
         if messagebox.askyesno('Etiquetas generadas',f'Guardadas {copies} etiquetas en hojas A4 (24 etiquetas por página, 70 × 35 mm cada una).\n\n¿Abrir el PDF para imprimir?'):
