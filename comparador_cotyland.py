@@ -12,7 +12,7 @@ from pathlib import Path
 from datetime import datetime
 
 APP_TITLE = 'Cotyland | Comparador de Precios y Etiquetas'
-APP_VERSION = '7.5.3'
+APP_VERSION = '7.5.5'
 
 
 def money(value):
@@ -195,8 +195,6 @@ class CatalogDB:
             raise ValueError('Ingresá un código de barras y un código interno.')
         if not self.get_product(code):
             raise ValueError(f'El código interno {code} no existe en el catálogo. Primero cargalo.')
-        if barcode == code:
-            return
         existing = self.conn.execute('SELECT codigo FROM codigos_alternativos WHERE alternativo=?', (barcode,)).fetchone()
         if existing and existing[0] != code:
             raise ValueError(f'El código de barras {barcode} ya está vinculado al artículo {existing[0]}.')
@@ -209,7 +207,7 @@ class CatalogDB:
         mapping = {}
         for code, barcode in rows:
             code, barcode = str(code).strip(), str(barcode).strip()
-            if not barcode or not code or code == barcode:
+            if not barcode or not code:
                 continue
             if barcode in mapping and mapping[barcode] != code:
                 raise ValueError(f'Código de barras duplicado: {barcode} para dos artículos.')
@@ -234,6 +232,17 @@ class CatalogDB:
         temp = self.legacy.with_suffix('.json.tmp')
         temp.write_text(json.dumps(codes, ensure_ascii=False), encoding='utf-8')
         os.replace(temp, self.legacy)
+
+    def resolve_verified_barcode(self, barcode):
+        """Scanner: ONLY an explicit barcode→IdArticulo association, never a SKU guess."""
+        barcode = str(barcode).strip()
+        if not barcode:
+            return None
+        row = self.conn.execute(
+            'SELECT c.codigo, c.descripcion, c.precio, c.en_tienda '
+            'FROM codigos_alternativos b JOIN catalogo c ON c.codigo=b.codigo '
+            'WHERE b.alternativo=?', (barcode,)).fetchone()
+        return dict(code=row[0], name=row[1], price=money(row[2] or '0'), store=bool(row[3])) if row else None
 
     def find_products(self, term, limit=75):
         term = str(term).strip()
@@ -729,108 +738,238 @@ class App(tk.Tk):
             messagebox.showerror('No se pudo importar el archivo', str(exc))
 
     def scan_product(self):
-        """Search by internal code or description; USB keyboard-wedge scanner sends Enter."""
-        dlg=tk.Toplevel(self)
-        dlg.title('Cotyland · Buscar, escanear o ingresar artículo')
-        dlg.geometry('830x540');dlg.minsize(670,410)
+        """Capture one or many barcode scans. Never resolve scanned values by fuzzy SKU search."""
+        dlg = tk.Toplevel(self)
+        dlg.title('Cotyland · Escaneo por código de barras')
+        dlg.geometry('1020x660')
+        dlg.minsize(810, 510)
         dlg.transient(self)
-        body=ttk.Frame(dlg,padding=14);body.pack(fill='both',expand=True)
-        ttk.Label(body,text='Escaneá un código o escribí código / descripción y presioná ENTER',
-                  font=('Segoe UI',11,'bold')).pack(anchor='w')
-        query=tk.StringVar()
-        entry=ttk.Entry(body,textvariable=query,font=('Segoe UI',13))
-        entry.pack(fill='x',pady=9)
-        cols=('code','name','price','store')
-        tree=ttk.Treeview(body,columns=cols,show='headings',selectmode='browse')
-        for key,title,width in [('code','Código',115),('name','Descripción',390),('price','Precio',130),('store','En tienda',80)]:
-            tree.heading(key,text=title);tree.column(key,width=width,stretch=key=='name')
-        tree.pack(fill='both',expand=True,pady=(0,8))
-        hint=tk.StringVar(value='Al escanear, se buscan coincidencias en la base guardada.')
-        ttk.Label(body,textvariable=hint).pack(anchor='w')
-        def find(_=None):
-            term=query.get().strip()
+        panel = ttk.Frame(dlg, padding=14)
+        panel.pack(fill='both', expand=True)
+        ttk.Label(panel, text='ESCANEO DE ARTÍCULOS — UNO O VARIOS',
+                  font=('Segoe UI', 13, 'bold')).pack(anchor='w')
+        ttk.Label(panel, text='Escaneá productos consecutivos: cada código se procesa y el campo se limpia solo. Para escribir manualmente, presioná Enter.',
+                  wraplength=920).pack(anchor='w', pady=(4, 8))
+        scan_row = ttk.Frame(panel)
+        scan_row.pack(fill='x')
+        ttk.Label(scan_row, text='Código de barras:').pack(side='left')
+        scan_value = tk.StringVar()
+        scan_entry = ttk.Entry(scan_row, textvariable=scan_value, font=('Segoe UI', 13))
+        scan_entry.pack(side='left', fill='x', expand=True, padx=9)
+        auto_capture = tk.BooleanVar(value=True)
+        ttk.Checkbutton(panel, text='Lectura continua (procesar automáticamente al terminar el escaneo)',
+                        variable=auto_capture).pack(anchor='w', pady=(5, 1))
+        ttk.Label(panel, text='Si el lector agrega Enter, se procesa inmediatamente. Si no, se procesa luego de una pausa de 450 ms. Desactivá la lectura continua para escribir despacio a mano.',
+                  wraplength=920).pack(anchor='w', pady=(0, 5))
+        auto_print = tk.BooleanVar(value=True)
+        ttk.Checkbutton(panel, text='Preparar automáticamente una etiqueta para cada artículo reconocido',
+                        variable=auto_print).pack(anchor='w', pady=(6, 8))
+
+        cols = ('barcode', 'code', 'name', 'price', 'state', 'count')
+        tree_box = ttk.Frame(panel)
+        tree_box.pack(fill='both', expand=True)
+        tree = ttk.Treeview(tree_box, columns=cols, show='headings', selectmode='browse')
+        for key, label, width in [('barcode','Barras leído',145),('code','IdArticulo',110),
+                                  ('name','Artículo',380),('price','Precio',115),
+                                  ('state','Estado',125),('count','Lecturas',70)]:
+            tree.heading(key, text=label)
+            tree.column(key, width=width, anchor='e' if key=='price' else 'w', stretch=key=='name')
+        tree.column('count', anchor='center')
+        scroll = ttk.Scrollbar(tree_box, orient='vertical', command=tree.yview)
+        tree.configure(yscrollcommand=scroll.set)
+        tree.pack(side='left', fill='both', expand=True)
+        scroll.pack(side='right', fill='y')
+
+        # Keys are the exact barcode strings read, not generated SKU approximations.
+        session = {}
+        scanned_copies = {}
+        info = tk.StringVar(value='0 lecturas. Código desconocido = pendiente, sin asignación automática.')
+        ttk.Label(panel, textvariable=info, wraplength=960).pack(anchor='w', pady=8)
+
+        def display():
+            selected = tree.selection()
             tree.delete(*tree.get_children())
-            matches=self.db.find_products(term)
-            for code,name,price,store in matches:
-                tree.insert('', 'end', iid=code, values=(code,name,display_money(money(price)), 'Sí' if store else 'No'))
-            hint.set(f'{len(matches)} coincidencias. ' + ('Usá AGREGAR NUEVO si el código no figura.' if not matches else 'Elegí una fila para continuar.'))
-            if len(matches)==1:tree.selection_set(matches[0][0]);tree.focus(matches[0][0])
-        entry.bind('<Return>',find)
-        def selected():
-            keys=tree.selection()
-            if not keys:
-                messagebox.showinfo('Elegí un artículo','Buscá o escaneá y elegí el artículo de la lista.',parent=dlg)
-                return None
-            return keys[0]
-        def link_unknown():
-            barcode=query.get().strip()
+            for barcode, item in session.items():
+                product = item.get('product')
+                status = 'Verificado' if product else 'PENDIENTE'
+                tree.insert('', 'end', iid=barcode, values=(barcode,
+                    product['code'] if product else '—',
+                    product['name'] if product else 'SIN IDENTIFICAR',
+                    display_money(product['price']) if product else '—',
+                    status, item['count']))
+            for selection in selected:
+                if tree.exists(selection):
+                    tree.selection_set(selection)
+            pending = sum(1 for x in session.values() if not x['product'])
+            info.set(f'{len(session)} códigos diferentes · {sum(x["count"] for x in session.values())} lecturas · '
+                     f'{pending} sin verificar. Los desconocidos NO se agregan ni imprimen.')
+
+        def capture(_event=None):
+            barcode = scan_value.get().strip()
+            scan_value.set('')
             if not barcode:
-                messagebox.showinfo('Escanear código', 'Escaneá primero el código de barras.', parent=dlg)
+                scan_entry.focus_set()
+                return
+            product = self.db.resolve_verified_barcode(barcode)
+            if barcode in session:
+                session[barcode]['count'] += 1
+                if product:
+                    session[barcode]['product'] = product
+            else:
+                session[barcode] = {'count': 1, 'product': product}
+            if product and auto_print.get():
+                code = product['code']
+                self.chosen.add(code)
+                # Count repeated scans of the same physical code as additional copies.
+                scanned_copies[code] = scanned_copies.get(code, 0) + 1
+                self.qty[code] = max(self.qty.get(code, 0), scanned_copies[code])
+                self._persist_print([code], True)
+                self.refresh()
+            display()
+            tree.selection_set(barcode)
+            tree.see(barcode)
+            scan_entry.focus_set()
+
+        # Los lectores USB son teclados: unos agregan Enter y otros no.
+        # Con lectura continua, capturar al detectar una pausa entre teclas.
+        # El temporizador se cancela con cada tecla para no cortar el código.
+        capture_job = None
+        def cancel_capture_job():
+            nonlocal capture_job
+            if capture_job is not None:
+                try:
+                    dlg.after_cancel(capture_job)
+                except tk.TclError:
+                    pass
+                capture_job = None
+
+        def capture_now(_event=None):
+            cancel_capture_job()
+            capture()
+            return 'break'  # Evita ejecutar dos veces la misma lectura.
+
+        def schedule_capture(*_args):
+            nonlocal capture_job
+            cancel_capture_job()
+            if auto_capture.get() and scan_value.get().strip():
+                capture_job = dlg.after(450, capture_now)
+
+        scan_value.trace_add('write', schedule_capture)
+        scan_entry.bind('<Return>', capture_now)
+        auto_capture.trace_add('write', schedule_capture)
+        dlg.bind('<Destroy>', lambda ev: cancel_capture_job() if ev.widget == dlg else None)
+
+        def chosen_barcode():
+            row = tree.selection()
+            if not row:
+                messagebox.showinfo('Elegí un código', 'Seleccioná una lectura en la tabla.', parent=dlg)
+                return None
+            return row[0]
+
+        def link_selected():
+            barcode = chosen_barcode()
+            if not barcode:
                 return
             from tkinter.simpledialog import askstring
-            internal=askstring('Vincular código de barras',
-                'Código leído: ' + barcode + '\n\nIngresá el CÓDIGO INTERNO (IdArticulo / SKU) de este producto:',
-                parent=dlg)
-            if not internal:
+            code = askstring('Vincular con A-Sistemas',
+                    'Código de barras leído: ' + barcode + '\n\nIngresá el IdArticulo EXACTO que muestra A-Sistemas:',
+                    parent=dlg)
+            if not code:
+                return
+            code = code.strip()
+            product = self.db.get_product(code)
+            if not product:
+                messagebox.showerror('Artículo no encontrado',
+                    'Ese IdArticulo no existe en el catálogo. No se guardó ninguna relación.', parent=dlg)
+                return
+            if not messagebox.askyesno('Confirmar equivalencia real',
+                    'Código de barras: ' + barcode + '\nCódigo interno: ' + code +
+                    '\nDescripción: ' + product['name'] +
+                    '\n\n¿Verificaste en A-Sistemas que este código de barras corresponde exactamente a ese artículo?',
+                    parent=dlg):
                 return
             try:
-                self.db.link_barcode(barcode, internal)
-                query.set(internal)
-                find()
-                hint.set('Código de barras ' + barcode + ' vinculado al artículo ' + internal + '. Se recordará en futuros escaneos.')
+                self.db.link_barcode(barcode, code)
+                session[barcode]['product'] = self.db.resolve_verified_barcode(barcode)
+                display()
+                tree.selection_set(barcode)
+                info.set('Equivalencia verificada y guardada. Podés escanear el siguiente producto.')
             except (ValueError, sqlite3.Error) as exc:
                 messagebox.showerror('No se pudo vincular', str(exc), parent=dlg)
+            scan_entry.focus_set()
 
-        def mark():
-            code=selected()
-            if not code:return
-            self.save_store([code],True); self.refresh();find()
-            hint.set(f'Artículo {code} marcado EN TIENDA y guardado permanentemente.')
-        def print_one():
-            code=selected()
-            if not code:return
+        def prepare_selected():
+            barcode = chosen_barcode()
+            if not barcode:
+                return
+            product = session[barcode]['product']
+            if not product:
+                messagebox.showwarning('Código no verificado',
+                    'No se puede preparar una etiqueta sin confirmar la relación código de barras → IdArticulo.', parent=dlg)
+                return
+            code = product['code']
             self.chosen.add(code)
+            scanned_copies[code] = scanned_copies.get(code, 0) + 1
+            self.qty[code] = max(self.qty.get(code, 0), scanned_copies[code])
             self._persist_print([code], True)
             self.refresh()
-            hint.set(f'Artículo {code} preparado para imprimir. Cerrá esta ventana y tocá CREAR ETIQUETAS PDF.')
-        def edit():
-            code=selected()
-            if not code:return
-            product=self.db.get_product(code)
-            editor(product)
-        def editor(product=None):
-            win=tk.Toplevel(dlg);win.title('Agregar / editar artículo');win.geometry('580x320')
-            win.transient(dlg);win.grab_set()
-            area=ttk.Frame(win,padding=18);area.pack(fill='both',expand=True)
-            vals=[tk.StringVar(value=product['code'] if product else query.get().strip()),
-                  tk.StringVar(value=product['name'] if product else ''),
-                  tk.StringVar(value=str(product['price']) if product else ''),
-                  tk.StringVar(value='')]
-            for ix,label in enumerate(['Código del artículo','Descripción','Precio de venta (ej. 1250,50)','Código de barras alternativo (opcional)']):
-                ttk.Label(area,text=label).grid(row=ix,column=0,sticky='w',pady=9)
-                ttk.Entry(area,textvariable=vals[ix],width=43).grid(row=ix,column=1,padx=10,sticky='ew',pady=9)
-            def save():
-                code,name,price,barcode=[v.get().strip() for v in vals]
-                if not code or not name or not price:
-                    messagebox.showerror('Faltan datos','Completá código, descripción y precio.',parent=win);return
-                try:
-                    self.db.save_product(code,name,price,True,barcode)
-                    self.in_store=self.db.store_codes()
-                    # The manual edit is available in the catalog immediately, not only after comparing.
-                    self.refresh()
-                    query.set(code);find();win.destroy()
-                except Exception as exc:
-                    messagebox.showerror('No se pudo guardar',str(exc),parent=win)
-            ttk.Button(area,text='GUARDAR Y MARCAR EN TIENDA',command=save).grid(row=4,column=0,columnspan=2,pady=15)
-            area.columnconfigure(1,weight=1)
-        buttons=ttk.Frame(body);buttons.pack(fill='x',pady=(6,0))
-        ttk.Button(buttons,text='BUSCAR',command=find).pack(side='left',padx=(0,7))
-        ttk.Button(buttons,text='MARCAR EN TIENDA',command=mark).pack(side='left',padx=(0,7))
-        ttk.Button(buttons,text='PREPARAR ETIQUETA',command=print_one).pack(side='left',padx=(0,7))
-        ttk.Button(buttons,text='EDITAR PRECIO',command=edit).pack(side='left',padx=(0,7))
-        ttk.Button(buttons,text='VINCULAR BARRAS A SKU',command=link_unknown).pack(side='right',padx=(6,0))
-        ttk.Button(buttons,text='AGREGAR NUEVO',command=lambda:editor()).pack(side='right')
-        entry.focus_set()
+            info.set('Etiqueta preparada para ' + product['name'] + '.')
+            scan_entry.focus_set()
+
+        def sku_search():
+            """Explicit separate SKU/manual lookup: never used to interpret a barcode scan."""
+            from tkinter.simpledialog import askstring
+            term = askstring('Buscar por código interno o descripción',
+                             'Ingresá un IdArticulo/SKU o una descripción (NO código de barras):', parent=dlg)
+            if not term:
+                return
+            matches = self.db.find_products(term, limit=15)
+            if not matches:
+                messagebox.showinfo('Sin resultados', 'No hay coincidencias en el catálogo.', parent=dlg)
+                return
+            msg = '\n'.join(f'{r[0]} — {r[1]}' for r in matches[:10])
+            messagebox.showinfo('Artículos encontrados', msg +
+                '\n\nPara vincular barras, verificá primero el IdArticulo en A-Sistemas y usá VINCULAR.', parent=dlg)
+            scan_entry.focus_set()
+
+        def add_manual():
+            """Manual product creation is explicit; no SKU is inferred from barcode."""
+            from tkinter.simpledialog import askstring
+            code = askstring('Nuevo artículo', 'Ingresá el IdArticulo REAL de A-Sistemas:', parent=dlg)
+            if not code:
+                return
+            code = code.strip()
+            name = askstring('Nuevo artículo', 'Descripción EXACTA del artículo:', parent=dlg)
+            if not name:
+                return
+            price = askstring('Nuevo artículo', 'Precio de venta actual:', parent=dlg)
+            if price is None:
+                return
+            try:
+                value = money(price)
+                if value < 0:
+                    raise ValueError('El precio no puede ser negativo.')
+                if not messagebox.askyesno('Confirmar artículo',
+                    f'IdArticulo: {code}\nDescripción: {name}\nPrecio: {display_money(value)}\n\n'
+                    '¿Confirmaste estos datos contra A-Sistemas?', parent=dlg):
+                    return
+                self.db.save_product(code, name, price, True)
+                self.in_store = self.db.store_codes()
+                self.refresh()
+                info.set('Artículo ' + code + ' guardado con los datos ingresados. Para asociar barras, escaneá y vinculá.')
+            except (ValueError, sqlite3.Error, OSError) as exc:
+                messagebox.showerror('Error al guardar artículo', str(exc), parent=dlg)
+            scan_entry.focus_set()
+
+        buttons = ttk.Frame(panel)
+        buttons.pack(fill='x', pady=(10, 0))
+        ttk.Button(buttons, text='AGREGAR LECTURA', command=capture).pack(side='left', padx=(0, 7))
+        ttk.Button(buttons, text='VINCULAR BARRAS CON ARTÍCULO', command=link_selected).pack(side='left', padx=(0, 7))
+        ttk.Button(buttons, text='PREPARAR ETIQUETA', command=prepare_selected).pack(side='left', padx=(0, 7))
+        ttk.Button(buttons, text='Buscar por SKU (separado)', command=sku_search).pack(side='left', padx=(0, 7))
+        ttk.Button(buttons, text='AGREGAR ARTÍCULO', command=add_manual).pack(side='left', padx=(0, 7))
+        ttk.Button(buttons, text='CERRAR', command=dlg.destroy).pack(side='right')
+        scan_entry.focus_set()
 
     def click_checkbox(self, event):
         row = self.table.identify_row(event.y)
