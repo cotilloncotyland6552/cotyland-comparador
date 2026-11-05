@@ -12,7 +12,7 @@ from pathlib import Path
 from datetime import datetime
 
 APP_TITLE = 'Cotyland | Comparador de Precios y Etiquetas'
-APP_VERSION = '7.5.2'
+APP_VERSION = '7.5.3'
 
 
 def money(value):
@@ -103,6 +103,7 @@ class CatalogDB:
         self.conn.execute('CREATE TABLE IF NOT EXISTS precios_manuales (codigo TEXT PRIMARY KEY, precio TEXT NOT NULL)')
         self.conn.execute('CREATE TABLE IF NOT EXISTS codigos_alternativos (alternativo TEXT PRIMARY KEY, codigo TEXT NOT NULL)')
         self.conn.execute('CREATE TABLE IF NOT EXISTS decisiones_impresion (lote TEXT NOT NULL, codigo TEXT NOT NULL, imprimir INTEGER NOT NULL, PRIMARY KEY(lote,codigo))')
+        self.conn.execute('CREATE TABLE IF NOT EXISTS preferencias_impresion (codigo TEXT NOT NULL, precio TEXT NOT NULL, imprimir INTEGER NOT NULL, PRIMARY KEY(codigo,precio))')
         self.conn.commit()
         # Import legacy selections only once: repeatedly migrating old JSON would recheck unmarked items.
         if not self.conn.execute("SELECT 1 FROM metadata WHERE clave='legacy_migrated'").fetchone():
@@ -167,6 +168,26 @@ class CatalogDB:
                 'INSERT INTO decisiones_impresion(lote,codigo,imprimir) VALUES (?,?,?) '
                 'ON CONFLICT(lote,codigo) DO UPDATE SET imprimir=excluded.imprimir',
                 ((lot, code, int(bool(value))) for code in codes))
+
+    def print_preferences(self, items):
+        """Saved print decisions by article + target price, independent of CSV revisions."""
+        if not items:
+            return {}
+        codes = [item['new']['code'] for item in items]
+        placeholders = ','.join('?' for _ in codes)
+        saved = self.conn.execute(
+            f'SELECT codigo,precio,imprimir FROM preferencias_impresion WHERE codigo IN ({placeholders})', codes).fetchall()
+        by_key = {(code, price): bool(flag) for code, price, flag in saved}
+        return {item['new']['code']: by_key[(item['new']['code'], str(item['new']['price']))]
+                for item in items if (item['new']['code'], str(item['new']['price'])) in by_key}
+
+    def set_print_preferences(self, rows):
+        """rows: iterable of (article code, updated price, print flag)."""
+        with self.conn:
+            self.conn.executemany(
+                'INSERT INTO preferencias_impresion(codigo,precio,imprimir) VALUES (?,?,?) '
+                'ON CONFLICT(codigo,precio) DO UPDATE SET imprimir=excluded.imprimir',
+                [(str(code),str(price),int(bool(enabled))) for code,price,enabled in rows])
 
     def link_barcode(self, barcode, code):
         barcode, code = str(barcode).strip(), str(code).strip()
@@ -444,7 +465,18 @@ class App(tk.Tk):
         return dig.hexdigest()
 
     def _persist_print(self, codes, enabled):
+        # Save both for backwards compatibility. The important record is by
+        # article + final price, not CSV bytes: re-exporting identical prices
+        # must NOT recheck the label the user rejected.
         self.db.set_print_decisions(self.current_lot, codes, enabled)
+        catalog = {row['new']['code']: row['new'] for row in self.changes + self.new_items}
+        updates = []
+        for code in codes:
+            product = catalog.get(code) or self.db.get_product(code)
+            if product:
+                updates.append((code, product['price'], enabled))
+        if updates:
+            self.db.set_print_preferences(updates)
 
     def compare(self):
         if not self.old_path.get() or not self.new_path.get():
@@ -468,7 +500,22 @@ class App(tk.Tk):
             self.current_lot = lot
             self.chosen = {item['new']['code'] for item in self.changes
                            if item['new']['code'] in self.in_store}
-            for code, enabled in self.db.print_decisions(lot).items():
+            # Previous versions saved per exact file pair; preserve their
+            # decisions for that pair and migrate them to the stronger rule.
+            legacy = self.db.print_decisions(lot)
+            for code, enabled in legacy.items():
+                if enabled:
+                    self.chosen.add(code)
+                else:
+                    self.chosen.discard(code)
+            valid = {row['new']['code']: row['new']['price'] for row in self.changes + self.new_items}
+            if legacy:
+                self.db.set_print_preferences((code,valid[code], enabled)
+                                              for code,enabled in legacy.items() if code in valid)
+            # Strongest rule: decisions persist for a given product / price
+            # even after re-exporting either CSV, using another PC's copies,
+            # or re-running the comparison.
+            for code, enabled in self.db.print_preferences(self.changes + self.new_items).items():
                 if enabled:
                     self.chosen.add(code)
                 else:
@@ -589,7 +636,8 @@ class App(tk.Tk):
                 if codes: self.db.set_store(codes, True, manual=False)
                 self.in_store = self.db.store_codes()
                 newly_in_store = self.in_store - previous_store
-                already_rejected = {code for code, enabled in self.db.print_decisions(self.current_lot).items() if not enabled}
+                already_rejected = {code for code, enabled in self.db.print_preferences(self.changes).items() if not enabled}
+                already_rejected.update(code for code, enabled in self.db.print_decisions(self.current_lot).items() if not enabled)
                 self.chosen.update(item['new']['code'] for item in self.changes
                                    if item['new']['code'] in newly_in_store and item['new']['code'] not in already_rejected)
                 dialog.destroy()
