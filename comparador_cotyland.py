@@ -4,6 +4,7 @@ import os
 import sys
 import subprocess
 import sqlite3
+import hashlib
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from decimal import Decimal, InvalidOperation
@@ -11,7 +12,7 @@ from pathlib import Path
 from datetime import datetime
 
 APP_TITLE = 'Cotyland | Comparador de Precios y Etiquetas'
-APP_VERSION = '7.5.1'
+APP_VERSION = '7.5.2'
 
 
 def money(value):
@@ -101,6 +102,7 @@ class CatalogDB:
         self.conn.execute('CREATE TABLE IF NOT EXISTS decisiones_manuales (codigo TEXT PRIMARY KEY, en_tienda INTEGER NOT NULL)')
         self.conn.execute('CREATE TABLE IF NOT EXISTS precios_manuales (codigo TEXT PRIMARY KEY, precio TEXT NOT NULL)')
         self.conn.execute('CREATE TABLE IF NOT EXISTS codigos_alternativos (alternativo TEXT PRIMARY KEY, codigo TEXT NOT NULL)')
+        self.conn.execute('CREATE TABLE IF NOT EXISTS decisiones_impresion (lote TEXT NOT NULL, codigo TEXT NOT NULL, imprimir INTEGER NOT NULL, PRIMARY KEY(lote,codigo))')
         self.conn.commit()
         # Import legacy selections only once: repeatedly migrating old JSON would recheck unmarked items.
         if not self.conn.execute("SELECT 1 FROM metadata WHERE clave='legacy_migrated'").fetchone():
@@ -150,6 +152,61 @@ class CatalogDB:
                  ((code,int(value)) for code in codes))
         self.write_legacy()
 
+    def print_decisions(self, lot):
+        if not lot:
+            return {}
+        return {code: bool(value) for code, value in
+                self.conn.execute('SELECT codigo,imprimir FROM decisiones_impresion WHERE lote=?', (lot,))}
+
+    def set_print_decisions(self, lot, codes, value):
+        if not lot:
+            return
+        codes = {str(code).strip() for code in codes if str(code).strip()}
+        with self.conn:
+            self.conn.executemany(
+                'INSERT INTO decisiones_impresion(lote,codigo,imprimir) VALUES (?,?,?) '
+                'ON CONFLICT(lote,codigo) DO UPDATE SET imprimir=excluded.imprimir',
+                ((lot, code, int(bool(value))) for code in codes))
+
+    def link_barcode(self, barcode, code):
+        barcode, code = str(barcode).strip(), str(code).strip()
+        if not barcode or not code:
+            raise ValueError('Ingresá un código de barras y un código interno.')
+        if not self.get_product(code):
+            raise ValueError(f'El código interno {code} no existe en el catálogo. Primero cargalo.')
+        if barcode == code:
+            return
+        existing = self.conn.execute('SELECT codigo FROM codigos_alternativos WHERE alternativo=?', (barcode,)).fetchone()
+        if existing and existing[0] != code:
+            raise ValueError(f'El código de barras {barcode} ya está vinculado al artículo {existing[0]}.')
+        with self.conn:
+            self.conn.execute('INSERT INTO codigos_alternativos(alternativo,codigo) VALUES (?,?) '
+                              'ON CONFLICT(alternativo) DO UPDATE SET codigo=excluded.codigo', (barcode, code))
+
+    def import_barcodes(self, rows):
+        """Validate whole batch first. Never replace a mapping for another item."""
+        mapping = {}
+        for code, barcode in rows:
+            code, barcode = str(code).strip(), str(barcode).strip()
+            if not barcode or not code or code == barcode:
+                continue
+            if barcode in mapping and mapping[barcode] != code:
+                raise ValueError(f'Código de barras duplicado: {barcode} para dos artículos.')
+            mapping[barcode] = code
+        available = {r[0] for r in self.conn.execute('SELECT codigo FROM catalogo')}
+        current = dict(self.conn.execute('SELECT alternativo,codigo FROM codigos_alternativos'))
+        missing = {c for c in mapping.values() if c not in available}
+        if missing:
+            raise ValueError(f'Hay {len(missing)} códigos internos que no figuran en la base. Ejemplo: {sorted(missing)[0]}')
+        conflict = [(b,c,current[b]) for b,c in mapping.items() if b in current and current[b] != c]
+        if conflict:
+            b,c,old = conflict[0]
+            raise ValueError(f'Conflicto: el código de barras {b} ya está asignado a {old}, no a {c}.')
+        with self.conn:
+            self.conn.executemany('INSERT INTO codigos_alternativos(alternativo,codigo) VALUES (?,?) '
+                                  'ON CONFLICT(alternativo) DO UPDATE SET codigo=excluded.codigo', mapping.items())
+        return len(mapping)
+
     def write_legacy(self):
         # Maintain backward-compatible JSON and prevent lost selections after older reinstall.
         codes = sorted(self.store_codes())
@@ -175,6 +232,10 @@ class CatalogDB:
         if not code: raise ValueError('El código no puede estar vacío.')
         price = money(price)
         if price < 0: raise ValueError('El precio debe ser mayor o igual a cero.')
+        if barcode and barcode.strip() != code:
+            prior = self.conn.execute('SELECT codigo FROM codigos_alternativos WHERE alternativo=?', (barcode.strip(),)).fetchone()
+            if prior and prior[0] != code:
+                raise ValueError(f'El código de barras ya pertenece al artículo {prior[0]}.')
         stamp = datetime.now().isoformat(timespec='seconds')
         with self.conn:
             self.conn.execute("INSERT INTO catalogo(codigo,descripcion,precio,en_tienda,actualizado_en) "
@@ -217,6 +278,7 @@ class App(tk.Tk):
         self.new_items = []
         self.visible = {}
         self.chosen = set()
+        self.current_lot = None
         self.qty = {}
         self.db = CatalogDB()
         self.in_store = self.db.store_codes()
@@ -282,6 +344,7 @@ class App(tk.Tk):
         ttk.Button(left_tools, text='Importar lista', command=self.import_store_csv, style='Compact.TButton').pack(side='left', padx=(0, 6))
         ttk.Button(left_tools, text='Copias…', command=self.set_copies, style='Compact.TButton').pack(side='left', padx=(0, 6))
         ttk.Button(left_tools, text='🔎 Buscar / escanear', command=self.scan_product, style='Compact.TButton').pack(side='left', padx=(0, 6))
+        ttk.Button(left_tools, text='Importar barras', command=self.import_barcode_csv, style='Compact.TButton').pack(side='left', padx=(0, 6))
 
         right_tools = tk.Frame(tools, bg='#f3f5f9')
         right_tools.pack(side='right')
@@ -370,6 +433,19 @@ class App(tk.Tk):
             messagebox.showerror('No se pudieron cargar las listas de Drive', str(exc) +
                 '\n\nComprobá que Drive haya terminado de sincronizar y que ambos archivos sean del mismo lote.')
 
+    @staticmethod
+    def _list_pair_id(old_path, new_path):
+        dig = hashlib.sha256()
+        for label, filename in [('viejo', old_path), ('nuevo', new_path)]:
+            dig.update(label.encode('ascii'))
+            with open(filename, 'rb') as src:
+                for chunk in iter(lambda: src.read(1024 * 1024), b''):
+                    dig.update(chunk)
+        return dig.hexdigest()
+
+    def _persist_print(self, codes, enabled):
+        self.db.set_print_decisions(self.current_lot, codes, enabled)
+
     def compare(self):
         if not self.old_path.get() or not self.new_path.get():
             messagebox.showwarning('Faltan archivos', 'Seleccioná los dos listados.'); return
@@ -377,6 +453,7 @@ class App(tk.Tk):
             self.configure(cursor='watch'); self.update_idletasks()
             before = load_csv(self.old_path.get())
             after = load_csv(self.new_path.get())
+            lot = self._list_pair_id(self.old_path.get(), self.new_path.get())
             self.changes = [dict(new=entry, old=before[code]['price']) for code, entry in after.items() if code in before and entry['price'] != before[code]['price']]
             self.new_items = [dict(new=entry, old=None) for code, entry in after.items() if code not in before]
             self.db.sync_catalog(after)
@@ -388,8 +465,14 @@ class App(tk.Tk):
             # únicamente los PRECIOS MODIFICADOS de productos marcados EN TIENDA.
             # Las dos selecciones son independientes: destildar impresión no
             # quita el artículo de tienda, ni se vuelve a tildar al refrescar.
+            self.current_lot = lot
             self.chosen = {item['new']['code'] for item in self.changes
                            if item['new']['code'] in self.in_store}
+            for code, enabled in self.db.print_decisions(lot).items():
+                if enabled:
+                    self.chosen.add(code)
+                else:
+                    self.chosen.discard(code)
             self.qty.clear()
             self.kind.set('Precios modificados'); self.search.set('')
             self.summary = f'{len(before):,} anteriores · {len(after):,} actuales · {len(self.changes):,} precios cambiados · {len(self.new_items):,} productos nuevos'.replace(',', '.')
@@ -506,8 +589,9 @@ class App(tk.Tk):
                 if codes: self.db.set_store(codes, True, manual=False)
                 self.in_store = self.db.store_codes()
                 newly_in_store = self.in_store - previous_store
+                already_rejected = {code for code, enabled in self.db.print_decisions(self.current_lot).items() if not enabled}
                 self.chosen.update(item['new']['code'] for item in self.changes
-                                   if item['new']['code'] in newly_in_store)
+                                   if item['new']['code'] in newly_in_store and item['new']['code'] not in already_rejected)
                 dialog.destroy()
                 self.refresh()
                 messagebox.showinfo('Importación realizada',
@@ -569,6 +653,33 @@ class App(tk.Tk):
                               'price':p,'stock':qty}
         return result,'simple',stock_found
 
+    def import_barcode_csv(self):
+        path = filedialog.askopenfilename(title='Importar códigos de barras e IdArticulo',
+                filetypes=[('Listados CSV', '*.csv'), ('Todos los archivos', '*.*')])
+        if not path:
+            return
+        try:
+            with open(path, 'r', encoding='utf-8-sig', newline='') as f:
+                sample = f.readline()
+                f.seek(0)
+                reader = csv.DictReader(f, delimiter=';' if sample.count(';') > sample.count(',') else ',')
+                names = {str(k).strip().lower().replace(' ', '').replace('_', ''): k for k in reader.fieldnames or []}
+                sku = next((names[n] for n in ('idarticulo', 'sku', 'codigointerno', 'codigo') if n in names), None)
+                bar = next((names[n] for n in ('codigobarra', 'codigobarras', 'códigobarra', 'códigobarras', 'barcode', 'ean', 'ean13') if n in names), None)
+                if not sku or not bar:
+                    raise ValueError('El CSV debe tener las columnas IdArticulo y Codigo_Barra (o similares).')
+                pairs = [(row.get(sku, ''), row.get(bar, '')) for row in reader]
+            if not pairs:
+                raise ValueError('El archivo no tiene registros.')
+            if not messagebox.askyesno('Importar códigos de barras',
+                    f'Se encontraron {len(pairs):,} filas.\n\nSe agregarán asociaciones código de barras ↔ código interno, sin reemplazar las existentes que correspondan a otro artículo. ¿Continuar?'):
+                return
+            count = self.db.import_barcodes(pairs)
+            messagebox.showinfo('Códigos de barras importados',
+                    f'Se incorporaron {count:,} asociaciones de código de barras. Ya podés escanear esos artículos.')
+        except (OSError, ValueError, csv.Error, sqlite3.Error) as exc:
+            messagebox.showerror('No se pudo importar el archivo', str(exc))
+
     def scan_product(self):
         """Search by internal code or description; USB keyboard-wedge scanner sends Enter."""
         dlg=tk.Toplevel(self)
@@ -603,6 +714,25 @@ class App(tk.Tk):
                 messagebox.showinfo('Elegí un artículo','Buscá o escaneá y elegí el artículo de la lista.',parent=dlg)
                 return None
             return keys[0]
+        def link_unknown():
+            barcode=query.get().strip()
+            if not barcode:
+                messagebox.showinfo('Escanear código', 'Escaneá primero el código de barras.', parent=dlg)
+                return
+            from tkinter.simpledialog import askstring
+            internal=askstring('Vincular código de barras',
+                'Código leído: ' + barcode + '\n\nIngresá el CÓDIGO INTERNO (IdArticulo / SKU) de este producto:',
+                parent=dlg)
+            if not internal:
+                return
+            try:
+                self.db.link_barcode(barcode, internal)
+                query.set(internal)
+                find()
+                hint.set('Código de barras ' + barcode + ' vinculado al artículo ' + internal + '. Se recordará en futuros escaneos.')
+            except (ValueError, sqlite3.Error) as exc:
+                messagebox.showerror('No se pudo vincular', str(exc), parent=dlg)
+
         def mark():
             code=selected()
             if not code:return
@@ -612,6 +742,7 @@ class App(tk.Tk):
             code=selected()
             if not code:return
             self.chosen.add(code)
+            self._persist_print([code], True)
             self.refresh()
             hint.set(f'Artículo {code} preparado para imprimir. Cerrá esta ventana y tocá CREAR ETIQUETAS PDF.')
         def edit():
@@ -649,6 +780,7 @@ class App(tk.Tk):
         ttk.Button(buttons,text='MARCAR EN TIENDA',command=mark).pack(side='left',padx=(0,7))
         ttk.Button(buttons,text='PREPARAR ETIQUETA',command=print_one).pack(side='left',padx=(0,7))
         ttk.Button(buttons,text='EDITAR PRECIO',command=edit).pack(side='left',padx=(0,7))
+        ttk.Button(buttons,text='VINCULAR BARRAS A SKU',command=link_unknown).pack(side='right',padx=(6,0))
         ttk.Button(buttons,text='AGREGAR NUEVO',command=lambda:editor()).pack(side='right')
         entry.focus_set()
 
@@ -658,11 +790,13 @@ class App(tk.Tk):
         if not row or self.table.identify_region(event.x, event.y) != 'cell': return
         if col == '#1':
             self.chosen.symmetric_difference_update({row})
+            self._persist_print([row], row in self.chosen)
         elif col == '#2':
             adding = row not in self.in_store
             self.save_store([row], adding)
             if adding and row in {x['new']['code'] for x in self.changes + self.new_items}:
                 self.chosen.add(row)
+                self._persist_print([row], True)
         else: return
         self.refresh()
 
@@ -672,7 +806,9 @@ class App(tk.Tk):
             messagebox.showinfo('Seleccioná filas', 'Seleccioná una o más filas con un clic (Ctrl o Shift para varias) y después usá este botón. También podés pulsar directamente la casilla En tienda.'); return
         self.save_store(codes, value)
         if value:
-            self.chosen.update(codes & {x['new']['code'] for x in self.changes + self.new_items})
+            newly_chosen = codes & {x['new']['code'] for x in self.changes + self.new_items}
+            self.chosen.update(newly_chosen)
+            self._persist_print(newly_chosen, True)
         self.refresh()
 
     def toggle_selected(self, event):
@@ -680,13 +816,16 @@ class App(tk.Tk):
         if not row or self.table.identify_column(event.x) in ('#1','#2'): return
         if row in self.chosen: self.chosen.remove(row)
         else: self.chosen.add(row)
+        self._persist_print([row], row in self.chosen)
         self.refresh()
 
     def mark_visible(self):
         self.chosen.update(self.visible)
+        self._persist_print(self.visible, True)
         self.refresh()
 
     def unmark(self):
+        self._persist_print(self.chosen, False)
         self.chosen.clear(); self.refresh()
 
     def set_copies(self):
