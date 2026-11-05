@@ -11,7 +11,7 @@ from pathlib import Path
 from datetime import datetime
 
 APP_TITLE = 'Cotyland | Comparador de Precios y Etiquetas'
-APP_VERSION = '7.3.0'
+APP_VERSION = '7.5.1'
 
 
 def money(value):
@@ -51,6 +51,42 @@ def load_csv(path):
     return result
 
 
+# Configuración local: no se publica en GitHub ni se sincroniza la base SQLite.
+DRIVE_DEFAULT = Path(r'G:\Mi unidad\Comparador NUEVO de precios\Listas de Precios')
+DRIVE_SETTINGS = Path(os.environ.get('APPDATA', str(Path.home()))) / 'Cotyland_Comparador' / 'listas_drive.json'
+
+
+def drive_folder_saved():
+    try:
+        value = json.loads(DRIVE_SETTINGS.read_text(encoding='utf-8')).get('carpeta', '')
+        return Path(value) if value else DRIVE_DEFAULT
+    except (OSError, ValueError, TypeError, AttributeError):
+        return DRIVE_DEFAULT
+
+
+def save_drive_folder(folder):
+    DRIVE_SETTINGS.parent.mkdir(parents=True, exist_ok=True)
+    DRIVE_SETTINGS.write_text(json.dumps({'carpeta':str(folder)}, ensure_ascii=False, indent=2), encoding='utf-8')
+
+
+def find_drive_pair(folder):
+    # Windows es case-insensitive; permitir también Linux o entornos de prueba.
+    folder = Path(folder)
+    if not folder.is_dir():
+        raise ValueError('La carpeta de Drive no está accesible: '+str(folder))
+    entries = {p.name.casefold(): p for p in folder.iterdir() if p.is_file()}
+    old = entries.get('viejo.csv')
+    new = entries.get('nuevo.csv')
+    if not old or not new:
+        raise ValueError('En la carpeta deben estar los dos archivos: viejo.csv y nuevo.csv.')
+    for p in (old, new):
+        if p.stat().st_size < 100:
+            raise ValueError(f'El archivo {p.name} parece vacío o incompleto.')
+    if old.stat().st_mtime > new.stat().st_mtime + 2:
+        raise ValueError('La fecha de viejo.csv es posterior a la de nuevo.csv. Revisá que sean del mismo cambio de precios.')
+    return old, new
+
+
 class CatalogDB:
     # Persistent database: outside program directory, never replaced by updater.
     def __init__(self):
@@ -63,6 +99,8 @@ class CatalogDB:
         self.conn.execute("CREATE TABLE IF NOT EXISTS catalogo (codigo TEXT PRIMARY KEY, descripcion TEXT NOT NULL DEFAULT '', precio TEXT, en_tienda INTEGER NOT NULL DEFAULT 0, visto_en TEXT, actualizado_en TEXT)")
         self.conn.execute('CREATE TABLE IF NOT EXISTS metadata (clave TEXT PRIMARY KEY, valor TEXT)')
         self.conn.execute('CREATE TABLE IF NOT EXISTS decisiones_manuales (codigo TEXT PRIMARY KEY, en_tienda INTEGER NOT NULL)')
+        self.conn.execute('CREATE TABLE IF NOT EXISTS precios_manuales (codigo TEXT PRIMARY KEY, precio TEXT NOT NULL)')
+        self.conn.execute('CREATE TABLE IF NOT EXISTS codigos_alternativos (alternativo TEXT PRIMARY KEY, codigo TEXT NOT NULL)')
         self.conn.commit()
         # Import legacy selections only once: repeatedly migrating old JSON would recheck unmarked items.
         if not self.conn.execute("SELECT 1 FROM metadata WHERE clave='legacy_migrated'").fetchone():
@@ -95,7 +133,7 @@ class CatalogDB:
         # Register ALL products, but NEVER auto-mark products as in store.
         stamp = datetime.now().isoformat(timespec='seconds')
         with self.conn:
-            self.conn.executemany('INSERT INTO catalogo (codigo,descripcion,precio,visto_en,actualizado_en) VALUES (?,?,?,?,?) ON CONFLICT(codigo) DO UPDATE SET descripcion=CASE WHEN length(excluded.descripcion)>0 THEN excluded.descripcion ELSE catalogo.descripcion END,precio=excluded.precio,visto_en=excluded.visto_en,actualizado_en=excluded.actualizado_en',
+            self.conn.executemany('INSERT INTO catalogo (codigo,descripcion,precio,visto_en,actualizado_en) VALUES (?,?,?,?,?) ON CONFLICT(codigo) DO UPDATE SET descripcion=CASE WHEN length(excluded.descripcion)>0 THEN excluded.descripcion ELSE catalogo.descripcion END,precio=CASE WHEN EXISTS(SELECT 1 FROM precios_manuales WHERE codigo=catalogo.codigo) THEN catalogo.precio ELSE excluded.precio END,visto_en=excluded.visto_en,actualizado_en=excluded.actualizado_en',
                 ((x['code'],x['name'],str(x['price']),stamp,stamp) for x in products.values()))
 
     def set_store(self, codes, value, manual=True):
@@ -119,6 +157,44 @@ class CatalogDB:
         temp.write_text(json.dumps(codes, ensure_ascii=False), encoding='utf-8')
         os.replace(temp, self.legacy)
 
+    def find_products(self, term, limit=75):
+        term = str(term).strip()
+        if not term: return []
+        # Scanner sends the same data as a keyboard, normally followed by Enter.
+        norm = '%' + term.replace('\\','\\\\').replace('%','\\%').replace('_','\\_') + '%'
+        return self.conn.execute(
+            "SELECT catalogo.codigo,catalogo.descripcion,catalogo.precio,catalogo.en_tienda FROM catalogo "
+            "LEFT JOIN codigos_alternativos a ON a.codigo=catalogo.codigo "
+            "WHERE catalogo.codigo LIKE ? ESCAPE '\\' OR catalogo.descripcion LIKE ? ESCAPE '\\' "
+            "OR a.alternativo LIKE ? ESCAPE '\\' "
+            "ORDER BY CASE WHEN catalogo.codigo=? OR a.alternativo=? THEN 0 ELSE 1 END, catalogo.descripcion LIMIT ?",
+            (norm,norm,norm,term,term,limit)).fetchall()
+
+    def save_product(self, code, name, price, in_store=True, barcode=''):
+        code = str(code).strip()
+        if not code: raise ValueError('El código no puede estar vacío.')
+        price = money(price)
+        if price < 0: raise ValueError('El precio debe ser mayor o igual a cero.')
+        stamp = datetime.now().isoformat(timespec='seconds')
+        with self.conn:
+            self.conn.execute("INSERT INTO catalogo(codigo,descripcion,precio,en_tienda,actualizado_en) "
+                "VALUES(?,?,?,?,?) ON CONFLICT(codigo) DO UPDATE SET "
+                "descripcion=excluded.descripcion,precio=excluded.precio,actualizado_en=excluded.actualizado_en",
+                (code, name.strip(), str(price), int(bool(in_store)),stamp))
+            self.conn.execute('INSERT INTO precios_manuales(codigo,precio) VALUES (?,?) ON CONFLICT(codigo) DO UPDATE SET precio=excluded.precio', (code,str(price)))
+            if barcode and barcode.strip() != code:
+                self.conn.execute('INSERT INTO codigos_alternativos(alternativo,codigo) VALUES (?,?) ON CONFLICT(alternativo) DO UPDATE SET codigo=excluded.codigo',(barcode.strip(),code))
+        if in_store:
+            self.set_store([code], True, manual=True)
+
+    def get_manual_price(self, code):
+        r=self.conn.execute('SELECT precio FROM precios_manuales WHERE codigo=?',(code,)).fetchone()
+        return money(r[0]) if r else None
+
+    def get_product(self, code):
+        r=self.conn.execute('SELECT codigo,descripcion,precio,en_tienda FROM catalogo WHERE codigo=?',(code,)).fetchone()
+        return dict(code=r[0],name=r[1],price=money(r[2] or '0'),store=bool(r[3])) if r else None
+
     def backup(self, destination):
         with sqlite3.connect(str(destination)) as dest:
             self.conn.backup(dest)
@@ -129,11 +205,12 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(APP_TITLE)
-        self.geometry('1180x740')
-        self.minsize(850, 570)
+        self.geometry('1280x800')
+        self.minsize(980, 620)
         self.configure(bg='#f3f5f9')
         self.old_path = tk.StringVar()
         self.new_path = tk.StringVar()
+        self.drive_folder = drive_folder_saved()
         self.search = tk.StringVar()
         self.kind = tk.StringVar(value='Precios modificados')
         self.changes = []
@@ -148,66 +225,96 @@ class App(tk.Tk):
 
     def _build(self):
         style = ttk.Style(self)
-        if 'clam' in style.theme_names(): style.theme_use('clam')
-        style.configure('Treeview', rowheight=28, font=('Segoe UI', 10), background='white', fieldbackground='white')
-        style.configure('Treeview.Heading', font=('Segoe UI', 10, 'bold'))
+        if 'clam' in style.theme_names():
+            style.theme_use('clam')
+        style.configure('Treeview', rowheight=26, font=('Segoe UI', 9), background='white', fieldbackground='white')
+        style.configure('Treeview.Heading', font=('Segoe UI', 9, 'bold'))
         style.map('Treeview', background=[('selected', '#ffdf69')], foreground=[('selected', '#161616')])
-        header = tk.Frame(self, bg='#ffe03a', padx=22, pady=16)
+        style.configure('Compact.TButton', padding=(8, 4), font=('Segoe UI', 9))
+        style.configure('Icon.TButton', padding=(6, 4), font=('Segoe UI Symbol', 9))
+        style.configure('Primary.TButton', padding=(10, 5), font=('Segoe UI', 9, 'bold'))
+
+        header = tk.Frame(self, bg='#ffe03a', padx=20, pady=10)
         header.pack(fill='x')
-        ttk.Button(header, text='BUSCAR ACTUALIZACIONES', command=self.check_updates).pack(side='right')
-        tk.Label(header, text='COTYLAND', font=('Segoe UI', 22, 'bold'), bg='#ffe03a').pack(anchor='w')
-        tk.Label(header, text='Comparador de precios y etiquetas · 7 × 3,5 cm', font=('Segoe UI', 11), bg='#ffe03a').pack(anchor='w')
-        files = tk.Frame(self, bg='#f3f5f9', padx=18, pady=14)
+        ttk.Button(header, text='BUSCAR ACTUALIZACIONES', command=self.check_updates, style='Compact.TButton').pack(side='right')
+        tk.Label(header, text='COTYLAND', font=('Segoe UI', 20, 'bold'), bg='#ffe03a').pack(anchor='w')
+        tk.Label(header, text='Comparador de precios y etiquetas · 7 × 3,5 cm', font=('Segoe UI', 10), bg='#ffe03a').pack(anchor='w')
+
+        files = tk.Frame(self, bg='#f3f5f9', padx=18, pady=10)
         files.pack(fill='x')
         self._file_row(files, 'LISTADO ANTERIOR', self.old_path, 0)
         self._file_row(files, 'LISTADO ACTUALIZADO', self.new_path, 1)
-        ttk.Button(files, text='COMPARAR LISTADOS', command=self.compare).grid(row=2, column=0, columnspan=3, sticky='ew', pady=(12,0), ipady=6)
         files.columnconfigure(1, weight=1)
-        bar = tk.Frame(self, bg='#f3f5f9', padx=18)
+        actions = tk.Frame(files, bg='#f3f5f9')
+        actions.grid(row=2, column=0, columnspan=3, sticky='ew', pady=(8, 0))
+        ttk.Button(actions, text='COMPARAR LISTADOS', command=self.compare, style='Compact.TButton').pack(side='left', fill='x', expand=True)
+        ttk.Button(actions, text='☁ CARGAR DESDE DRIVE', command=self.load_from_drive, style='Compact.TButton').pack(side='left', padx=(8, 0))
+        ttk.Button(actions, text='📁', command=self.choose_drive_folder, style='Icon.TButton').pack(side='left', padx=(6, 0))
+
+        bar = tk.Frame(self, bg='#f3f5f9', padx=18, pady=2)
         bar.pack(fill='x')
         tk.Label(bar, text='Ver:', bg='#f3f5f9').pack(side='left')
-        cb = ttk.Combobox(bar, textvariable=self.kind, values=['Precios modificados','Artículos nuevos','Catálogo en tienda'], state='readonly', width=23)
-        cb.pack(side='left', padx=(8,18)); cb.bind('<<ComboboxSelected>>', lambda _: self.refresh())
-        self.new_count_label = tk.Label(bar, text='PRODUCTOS NUEVOS: 0', bg='#fff1b8', fg='#332700', font=('Segoe UI', 10, 'bold'), padx=8, pady=5, cursor='hand2')
-        self.new_count_label.pack(side='left', padx=(0,12))
+        cb = ttk.Combobox(bar, textvariable=self.kind, values=['Precios modificados', 'Artículos nuevos', 'Catálogo en tienda'], state='readonly', width=20)
+        cb.pack(side='left', padx=(6, 10))
+        cb.bind('<<ComboboxSelected>>', lambda _: self.refresh())
+        ttk.Button(bar, text='Catálogo inicial', command=self.import_store_csv, style='Compact.TButton').pack(side='left', padx=(0, 10))
+        self.new_count_label = tk.Label(bar, text='PRODUCTOS NUEVOS: 0', bg='#fff1b8', fg='#332700', font=('Segoe UI', 9, 'bold'), padx=8, pady=3, cursor='hand2')
+        self.new_count_label.pack(side='left', padx=(0, 12))
         self.new_count_label.bind('<Button-1>', lambda _: self.show_new_products())
         tk.Label(bar, text='Buscar:', bg='#f3f5f9').pack(side='left')
         entry = ttk.Entry(bar, textvariable=self.search)
-        entry.pack(side='left', fill='x', expand=True, padx=(8,0))
-        ttk.Checkbutton(bar, text='Solo productos en tienda', variable=self.only_store, command=self.refresh).pack(side='left', padx=(12,0))
+        entry.pack(side='left', fill='x', expand=True, padx=(6, 8))
+        ttk.Checkbutton(bar, text='Solo productos en tienda', variable=self.only_store, command=self.refresh).pack(side='left')
         self.search.trace_add('write', lambda *_: self.refresh())
+
         self.status = tk.StringVar(value='Cargá los dos archivos CSV y tocá COMPARAR LISTADOS.')
-        tk.Label(self, textvariable=self.status, bg='#f3f5f9', fg='#364152', font=('Segoe UI', 10, 'bold'), anchor='w', padx=20, pady=10).pack(fill='x')
-        frame = tk.Frame(self, padx=18, bg='#f3f5f9')
+        tk.Label(self, textvariable=self.status, bg='#f3f5f9', fg='#364152', font=('Segoe UI', 9, 'bold'), anchor='w', padx=18, pady=5).pack(fill='x')
+
+        tools = tk.Frame(self, bg='#f3f5f9', padx=18, pady=2)
+        tools.pack(fill='x')
+        left_tools = tk.Frame(tools, bg='#f3f5f9')
+        left_tools.pack(side='left', fill='x', expand=True)
+        ttk.Button(left_tools, text='Marcar visibles', command=self.mark_visible, style='Compact.TButton').pack(side='left', padx=(0, 6))
+        ttk.Button(left_tools, text='Desmarcar', command=self.unmark, style='Compact.TButton').pack(side='left', padx=(0, 6))
+        ttk.Button(left_tools, text='Marcar tienda', command=lambda: self.set_store(True), style='Compact.TButton').pack(side='left', padx=(0, 6))
+        ttk.Button(left_tools, text='Quitar tienda', command=lambda: self.set_store(False), style='Compact.TButton').pack(side='left', padx=(0, 6))
+        ttk.Button(left_tools, text='Agregar nuevos', command=lambda: self.set_store(True), style='Compact.TButton').pack(side='left', padx=(0, 6))
+        ttk.Button(left_tools, text='Importar lista', command=self.import_store_csv, style='Compact.TButton').pack(side='left', padx=(0, 6))
+        ttk.Button(left_tools, text='Copias…', command=self.set_copies, style='Compact.TButton').pack(side='left', padx=(0, 6))
+        ttk.Button(left_tools, text='🔎 Buscar / escanear', command=self.scan_product, style='Compact.TButton').pack(side='left', padx=(0, 6))
+
+        right_tools = tk.Frame(tools, bg='#f3f5f9')
+        right_tools.pack(side='right')
+        ttk.Button(right_tools, text='🗄 Respaldo', command=self.backup_catalog, style='Compact.TButton').pack(side='right', padx=(6, 0))
+        ttk.Button(right_tools, text='▌║█║ Etiquetas', command=self.labels, style='Primary.TButton').pack(side='right', padx=(6, 0))
+        ttk.Button(right_tools, text='⤓ Exportar', command=self.export, style='Compact.TButton').pack(side='right', padx=(6, 0))
+
+        frame = tk.Frame(self, padx=18, pady=8, bg='#f3f5f9')
         frame.pack(fill='both', expand=True)
-        columns = ('marked', 'store', 'code','name','old','new','qty')
+        columns = ('marked', 'store', 'code', 'name', 'old', 'new', 'qty')
         self.table = ttk.Treeview(frame, columns=columns, show='headings', selectmode='extended')
-        for key, title, width, anchor in [('marked','Imprimir',75,'center'),('store','En tienda',75,'center'),('code','Código',125,'w'),('name','Descripción',480,'w'),('old','Precio anterior',140,'e'),('new','Precio nuevo',140,'e'),('qty','Copias',70,'center')]:
+        specs = [
+            ('marked', 'Imprimir', 72, 'center'),
+            ('store', 'En tienda', 72, 'center'),
+            ('code', 'Código', 105, 'w'),
+            ('name', 'Descripción', 560, 'w'),
+            ('old', 'Precio anterior', 120, 'e'),
+            ('new', 'Precio nuevo', 120, 'e'),
+            ('qty', 'Copias', 60, 'center'),
+        ]
+        for key, title, width, anchor in specs:
             self.table.heading(key, text=title)
-            self.table.column(key, width=width, minwidth=60, anchor=anchor, stretch=(key=='name'))
-        sc = ttk.Scrollbar(frame, orient='vertical', command=self.table.yview)
-        self.table.configure(yscrollcommand=sc.set)
-        self.table.pack(side='left', fill='both', expand=True)
-        sc.pack(side='right', fill='y')
+            self.table.column(key, width=width, minwidth=52, anchor=anchor, stretch=(key == 'name'))
+        sc_y = ttk.Scrollbar(frame, orient='vertical', command=self.table.yview)
+        sc_x = ttk.Scrollbar(frame, orient='horizontal', command=self.table.xview)
+        self.table.configure(yscrollcommand=sc_y.set, xscrollcommand=sc_x.set)
+        self.table.grid(row=0, column=0, sticky='nsew')
+        sc_y.grid(row=0, column=1, sticky='ns')
+        sc_x.grid(row=1, column=0, sticky='ew')
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(0, weight=1)
         self.table.bind('<Button-1>', self.click_checkbox)
         self.table.bind('<Double-1>', self.toggle_selected)
-        footer = tk.Frame(self, bg='white', padx=18, pady=9)
-        footer.pack(fill='x')
-        actions_top = tk.Frame(footer, bg='white')
-        actions_top.pack(fill='x', pady=(0,5))
-        ttk.Button(actions_top, text='Marcar visibles para imprimir', command=self.mark_visible).pack(side='left', padx=(0,8))
-        ttk.Button(actions_top, text='Desmarcar impresión', command=self.unmark).pack(side='left', padx=(0,8))
-        ttk.Button(actions_top, text='Copias seleccionadas…', command=self.set_copies).pack(side='left', padx=(0,8))
-        ttk.Button(actions_top, text='CREAR ETIQUETAS PDF', command=self.labels).pack(side='right')
-        ttk.Button(actions_top, text='Exportar cambios CSV', command=self.export).pack(side='right', padx=(8,8))
-        actions_bottom = tk.Frame(footer, bg='white')
-        actions_bottom.pack(fill='x')
-        ttk.Button(actions_bottom, text='Marcar en tienda', command=lambda: self.set_store(True)).pack(side='left', padx=(0,8))
-        ttk.Button(actions_bottom, text='Quitar de tienda', command=lambda: self.set_store(False)).pack(side='left', padx=(0,8))
-        ttk.Button(actions_bottom, text='Agregar nuevos a tienda', command=lambda: self.set_store(True)).pack(side='left', padx=(0,8))
-        ttk.Button(actions_bottom, text='IMPORTAR LISTA DE TIENDA', command=self.import_store_csv).pack(side='left', padx=(0,8))
-        ttk.Button(actions_bottom, text='RESPALDAR BASE', command=self.backup_catalog).pack(side='right')
-
     def check_updates(self):
         import updater
         from tkinter.simpledialog import askstring
@@ -234,13 +341,34 @@ class App(tk.Tk):
                 '\n\nPodés cambiar la dirección editando actualizaciones.json junto al programa.')
 
     def _file_row(self, parent, label, var, row):
-        tk.Label(parent, text=label, bg='#f3f5f9', font=('Segoe UI', 10, 'bold')).grid(row=row, column=0, padx=(0,12), pady=6, sticky='w')
-        ttk.Entry(parent, textvariable=var).grid(row=row, column=1, sticky='ew', pady=6)
-        ttk.Button(parent, text='Examinar…', command=lambda: self.browse(var)).grid(row=row, column=2, padx=(12,0), pady=6)
+        tk.Label(parent, text=label, bg='#f3f5f9', font=('Segoe UI', 10, 'bold')).grid(row=row, column=0, padx=(0,10), pady=4, sticky='w')
+        ttk.Entry(parent, textvariable=var).grid(row=row, column=1, sticky='ew', pady=4)
+        ttk.Button(parent, text='Examinar', command=lambda: self.browse(var), style='Compact.TButton').grid(row=row, column=2, padx=(10,0), pady=4)
 
     def browse(self, var):
         path = filedialog.askopenfilename(title='Seleccionar listado CSV', filetypes=[('CSV', '*.csv'), ('Todos los archivos','*.*')])
         if path: var.set(path)
+
+    def choose_drive_folder(self):
+        folder = filedialog.askdirectory(title='Elegí la carpeta de Google Drive que contiene viejo.csv y nuevo.csv',
+                                        initialdir=str(self.drive_folder) if self.drive_folder.is_dir() else None)
+        if folder:
+            self.drive_folder = Path(folder)
+            save_drive_folder(self.drive_folder)
+            messagebox.showinfo('Carpeta de Drive guardada', str(self.drive_folder))
+        return bool(folder)
+
+    def load_from_drive(self):
+        try:
+            if not self.drive_folder.is_dir():
+                if not self.choose_drive_folder(): return
+            old, new = find_drive_pair(self.drive_folder)
+            self.old_path.set(str(old))
+            self.new_path.set(str(new))
+            self.compare()
+        except Exception as exc:
+            messagebox.showerror('No se pudieron cargar las listas de Drive', str(exc) +
+                '\n\nComprobá que Drive haya terminado de sincronizar y que ambos archivos sean del mismo lote.')
 
     def compare(self):
         if not self.old_path.get() or not self.new_path.get():
@@ -256,7 +384,13 @@ class App(tk.Tk):
             self.changes.sort(key=lambda item: item['new']['name'].casefold())
             self.new_items.sort(key=lambda item: item['new']['name'].casefold())
             self.new_count_label.config(text=f'PRODUCTOS NUEVOS: {len(self.new_items):,}'.replace(',', '.'))
-            self.chosen.clear(); self.qty.clear()
+            # Cada comparación nueva selecciona por defecto para IMPRIMIR
+            # únicamente los PRECIOS MODIFICADOS de productos marcados EN TIENDA.
+            # Las dos selecciones son independientes: destildar impresión no
+            # quita el artículo de tienda, ni se vuelve a tildar al refrescar.
+            self.chosen = {item['new']['code'] for item in self.changes
+                           if item['new']['code'] in self.in_store}
+            self.qty.clear()
             self.kind.set('Precios modificados'); self.search.set('')
             self.summary = f'{len(before):,} anteriores · {len(after):,} actuales · {len(self.changes):,} precios cambiados · {len(self.new_items):,} productos nuevos'.replace(',', '.')
             self.refresh()
@@ -310,7 +444,7 @@ class App(tk.Tk):
         repeated-header 16-column CSV, simple CSV with Codigo column, or a stock CSV.
         An active flag or a price is never automatically interpreted as stock.
         """
-        path = filedialog.askopenfilename(title='Elegir lista para marcar artículos en tienda',
+        path = filedialog.askopenfilename(title='Elegir catálogo inicial CSV o listado con stock',
             filetypes=[('Archivos CSV','*.csv'),('Todos los archivos','*.*')])
         if not path: return
         try:
@@ -349,7 +483,7 @@ class App(tk.Tk):
         ttk.Radiobutton(container,variable=mode,value='none',text='Solo cargar datos de artículos, SIN marcar ninguno en tienda').pack(anchor='w',pady=3)
         ttk.Radiobutton(container,variable=mode,value='priced',text=f'Marcar como selección PROVISIONAL los {priced:,} artículos con precio mayor a cero').pack(anchor='w',pady=3)
         ttk.Radiobutton(container,variable=mode,value='all',text=f'Marcar TODOS los {len(rows):,} códigos del archivo (solo si realmente son de la tienda)').pack(anchor='w',pady=3)
-        ttk.Label(container,text='Las marcas existentes se conservan y las decisiones manuales tienen prioridad sobre nuevas importaciones.',wraplength=665).pack(anchor='w',pady=(12,4))
+        ttk.Label(container,text='Esta carga es PROVISIONAL. Las marcas existentes se conservan; las decisiones manuales tienen prioridad.',wraplength=665).pack(anchor='w',pady=(12,4))
         def apply():
             selection = mode.get()
             codes = ([p['code'] for p in rows.values() if p.get('stock') is not None and p['stock'] != 0]
@@ -368,8 +502,12 @@ class App(tk.Tk):
                     return
             try:
                 self.db.sync_catalog({p['code']:dict(code=p['code'],name=p['name'],price=p.get('price') or Decimal(0)) for p in rows.values()})
+                previous_store = set(self.in_store)
                 if codes: self.db.set_store(codes, True, manual=False)
                 self.in_store = self.db.store_codes()
+                newly_in_store = self.in_store - previous_store
+                self.chosen.update(item['new']['code'] for item in self.changes
+                                   if item['new']['code'] in newly_in_store)
                 dialog.destroy()
                 self.refresh()
                 messagebox.showinfo('Importación realizada',
@@ -431,6 +569,89 @@ class App(tk.Tk):
                               'price':p,'stock':qty}
         return result,'simple',stock_found
 
+    def scan_product(self):
+        """Search by internal code or description; USB keyboard-wedge scanner sends Enter."""
+        dlg=tk.Toplevel(self)
+        dlg.title('Cotyland · Buscar, escanear o ingresar artículo')
+        dlg.geometry('830x540');dlg.minsize(670,410)
+        dlg.transient(self)
+        body=ttk.Frame(dlg,padding=14);body.pack(fill='both',expand=True)
+        ttk.Label(body,text='Escaneá un código o escribí código / descripción y presioná ENTER',
+                  font=('Segoe UI',11,'bold')).pack(anchor='w')
+        query=tk.StringVar()
+        entry=ttk.Entry(body,textvariable=query,font=('Segoe UI',13))
+        entry.pack(fill='x',pady=9)
+        cols=('code','name','price','store')
+        tree=ttk.Treeview(body,columns=cols,show='headings',selectmode='browse')
+        for key,title,width in [('code','Código',115),('name','Descripción',390),('price','Precio',130),('store','En tienda',80)]:
+            tree.heading(key,text=title);tree.column(key,width=width,stretch=key=='name')
+        tree.pack(fill='both',expand=True,pady=(0,8))
+        hint=tk.StringVar(value='Al escanear, se buscan coincidencias en la base guardada.')
+        ttk.Label(body,textvariable=hint).pack(anchor='w')
+        def find(_=None):
+            term=query.get().strip()
+            tree.delete(*tree.get_children())
+            matches=self.db.find_products(term)
+            for code,name,price,store in matches:
+                tree.insert('', 'end', iid=code, values=(code,name,display_money(money(price)), 'Sí' if store else 'No'))
+            hint.set(f'{len(matches)} coincidencias. ' + ('Usá AGREGAR NUEVO si el código no figura.' if not matches else 'Elegí una fila para continuar.'))
+            if len(matches)==1:tree.selection_set(matches[0][0]);tree.focus(matches[0][0])
+        entry.bind('<Return>',find)
+        def selected():
+            keys=tree.selection()
+            if not keys:
+                messagebox.showinfo('Elegí un artículo','Buscá o escaneá y elegí el artículo de la lista.',parent=dlg)
+                return None
+            return keys[0]
+        def mark():
+            code=selected()
+            if not code:return
+            self.save_store([code],True); self.refresh();find()
+            hint.set(f'Artículo {code} marcado EN TIENDA y guardado permanentemente.')
+        def print_one():
+            code=selected()
+            if not code:return
+            self.chosen.add(code)
+            self.refresh()
+            hint.set(f'Artículo {code} preparado para imprimir. Cerrá esta ventana y tocá CREAR ETIQUETAS PDF.')
+        def edit():
+            code=selected()
+            if not code:return
+            product=self.db.get_product(code)
+            editor(product)
+        def editor(product=None):
+            win=tk.Toplevel(dlg);win.title('Agregar / editar artículo');win.geometry('580x320')
+            win.transient(dlg);win.grab_set()
+            area=ttk.Frame(win,padding=18);area.pack(fill='both',expand=True)
+            vals=[tk.StringVar(value=product['code'] if product else query.get().strip()),
+                  tk.StringVar(value=product['name'] if product else ''),
+                  tk.StringVar(value=str(product['price']) if product else ''),
+                  tk.StringVar(value='')]
+            for ix,label in enumerate(['Código del artículo','Descripción','Precio de venta (ej. 1250,50)','Código de barras alternativo (opcional)']):
+                ttk.Label(area,text=label).grid(row=ix,column=0,sticky='w',pady=9)
+                ttk.Entry(area,textvariable=vals[ix],width=43).grid(row=ix,column=1,padx=10,sticky='ew',pady=9)
+            def save():
+                code,name,price,barcode=[v.get().strip() for v in vals]
+                if not code or not name or not price:
+                    messagebox.showerror('Faltan datos','Completá código, descripción y precio.',parent=win);return
+                try:
+                    self.db.save_product(code,name,price,True,barcode)
+                    self.in_store=self.db.store_codes()
+                    # The manual edit is available in the catalog immediately, not only after comparing.
+                    self.refresh()
+                    query.set(code);find();win.destroy()
+                except Exception as exc:
+                    messagebox.showerror('No se pudo guardar',str(exc),parent=win)
+            ttk.Button(area,text='GUARDAR Y MARCAR EN TIENDA',command=save).grid(row=4,column=0,columnspan=2,pady=15)
+            area.columnconfigure(1,weight=1)
+        buttons=ttk.Frame(body);buttons.pack(fill='x',pady=(6,0))
+        ttk.Button(buttons,text='BUSCAR',command=find).pack(side='left',padx=(0,7))
+        ttk.Button(buttons,text='MARCAR EN TIENDA',command=mark).pack(side='left',padx=(0,7))
+        ttk.Button(buttons,text='PREPARAR ETIQUETA',command=print_one).pack(side='left',padx=(0,7))
+        ttk.Button(buttons,text='EDITAR PRECIO',command=edit).pack(side='left',padx=(0,7))
+        ttk.Button(buttons,text='AGREGAR NUEVO',command=lambda:editor()).pack(side='right')
+        entry.focus_set()
+
     def click_checkbox(self, event):
         row = self.table.identify_row(event.y)
         col = self.table.identify_column(event.x)
@@ -438,7 +659,10 @@ class App(tk.Tk):
         if col == '#1':
             self.chosen.symmetric_difference_update({row})
         elif col == '#2':
-            self.save_store([row], row not in self.in_store)
+            adding = row not in self.in_store
+            self.save_store([row], adding)
+            if adding and row in {x['new']['code'] for x in self.changes + self.new_items}:
+                self.chosen.add(row)
         else: return
         self.refresh()
 
@@ -446,7 +670,10 @@ class App(tk.Tk):
         codes = set(self.table.selection())
         if not codes:
             messagebox.showinfo('Seleccioná filas', 'Seleccioná una o más filas con un clic (Ctrl o Shift para varias) y después usá este botón. También podés pulsar directamente la casilla En tienda.'); return
-        self.save_store(codes, value); self.refresh()
+        self.save_store(codes, value)
+        if value:
+            self.chosen.update(codes & {x['new']['code'] for x in self.changes + self.new_items})
+        self.refresh()
 
     def toggle_selected(self, event):
         row = self.table.identify_row(event.y)
@@ -493,7 +720,17 @@ class App(tk.Tk):
             messagebox.showerror('Falta dependencia', 'Instalá ReportLab con: py -m pip install reportlab'); return
         # Evitar impresiones accidentales de decenas de miles de páginas.
         rows = {x['new']['code']:x for x in self.changes + self.new_items}
-        selected = [rows[k] for k in self.chosen if k in rows]
+        for code in self.chosen:
+            if code not in rows:
+                p=self.db.get_product(code)
+                if p:rows[code]={'new':p,'old':None}
+        selected = []
+        for code in self.chosen:
+            if code not in rows: continue
+            item = dict(rows[code]); item['new'] = dict(item['new'])
+            manual_price = self.db.get_manual_price(code)
+            if manual_price is not None: item['new']['price'] = manual_price
+            selected.append(item)
         copies = sum(self.qty.get(x['new']['code'], 1) for x in selected)
         if copies > 5000 and not messagebox.askyesno('Muchas etiquetas',f'Se van a generar {copies} etiquetas. ¿Continuar?'): return
         path = filedialog.asksaveasfilename(defaultextension='.pdf', initialfile='etiquetas_cotyland_A4_24.pdf', filetypes=[('PDF','*.pdf')])
