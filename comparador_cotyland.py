@@ -14,7 +14,7 @@ from pathlib import Path
 from datetime import datetime
 
 APP_TITLE = 'Cotyland | Comparador de Precios y Etiquetas'
-APP_VERSION = '7.5.7'
+APP_VERSION = '7.5.9'
 # Asociaciones del Libro1.xlsx recuperadas de filas normales y texto tabulado incrustado.
 # Verificadas contra SKU y descripcion de catalogos reales de Cotyland.
 # NO deducir ceros iniciales, NO transformar ni inventar codigos.
@@ -2029,7 +2029,32 @@ class CatalogDB:
             'SELECT c.codigo, c.descripcion, c.precio, c.en_tienda '
             'FROM codigos_alternativos b JOIN catalogo c ON c.codigo=b.codigo '
             'WHERE b.alternativo=?', (barcode,)).fetchone()
-        return dict(code=row[0], name=row[1], price=money(row[2] or '0'), store=bool(row[3])) if row else None
+        if row:
+            return dict(code=row[0], name=row[1], price=money(row[2] or '0'),
+                        store=bool(row[3]), barcode_source='asociacion')
+        # Codigos propios Cotyland: el punto es un prefijo REAL que imprime el
+        # negocio delante de un IdArticulo de ocho digitos. La lectura literal
+        # ".10302830" identifica SOLO el IdArticulo exacto "10302830".
+        # Nunca se aplica a lecturas normales ni a codigos parciales; tampoco
+        # se guarda una asociacion supuesta en la tabla de barras verificadas.
+        if len(barcode) == 9 and barcode.startswith('.') and barcode[1:].isascii() and barcode[1:].isdigit():
+            own = self.get_product(barcode[1:])
+            if own:
+                own['barcode_source'] = 'codigo_propio'
+                return own
+        return None
+
+    def verified_barcode_for_label(self, code):
+        """Return the one unambiguous known physical barcode, or None.
+
+        Never print a SKU in place of a barcode and never arbitrarily choose
+        among different physical barcodes associated with the same article.
+        """
+        rows = self.conn.execute(
+            'SELECT b.alternativo FROM codigos_alternativos b '
+            'LEFT JOIN barras_ambiguas a ON a.codigo_barras=b.alternativo '
+            'WHERE b.codigo=? AND a.codigo_barras IS NULL', (str(code),)).fetchall()
+        return rows[0][0] if len(rows) == 1 else None
 
     def find_products(self, term, limit=75):
         term = str(term).strip()
@@ -2587,6 +2612,7 @@ class App(tk.Tk):
         # Keys are the exact barcode strings read, not generated SKU approximations.
         session = {}
         scanned_copies = {}
+        scanned_barcode_copies = {}
         info = tk.StringVar(value='0 lecturas. Código desconocido = pendiente, sin asignación automática.')
         ttk.Label(panel, textvariable=info, wraplength=960).pack(anchor='w', pady=8)
 
@@ -2595,7 +2621,8 @@ class App(tk.Tk):
             tree.delete(*tree.get_children())
             for barcode, item in session.items():
                 product = item.get('product')
-                status = 'Verificado' if product else 'PENDIENTE'
+                status = ('Código propio' if product and product.get('barcode_source') == 'codigo_propio'
+                          else 'Verificado') if product else 'PENDIENTE'
                 tree.insert('', 'end', iid=barcode, values=(barcode,
                     product['code'] if product else '—',
                     product['name'] if product else 'SIN IDENTIFICAR',
@@ -2621,8 +2648,14 @@ class App(tk.Tk):
                     session[barcode]['product'] = product
             else:
                 session[barcode] = {'count': 1, 'product': product}
+            if product:
+                # A real, verified manual scanner reading means the item is physically
+                # in the store. Persist this choice before preparing labels.
+                if product['code'] not in self.in_store:
+                    self.save_store([product['code']], True)
             if product and auto_print.get():
                 code = product['code']
+                scanned_barcode_copies[barcode] = scanned_barcode_copies.get(barcode, 0) + 1
                 self.chosen.add(code)
                 # Count repeated scans of the same physical code as additional copies.
                 scanned_copies[code] = scanned_copies.get(code, 0) + 1
@@ -2672,7 +2705,7 @@ class App(tk.Tk):
                 scan_entry.focus_set()
                 return
             # Scan output is independent of any other changes selected in the main window.
-            self.labels(only_codes=codes, copies_override=dict(scanned_copies))
+            self.labels(only_codes=codes, barcode_counts=dict(scanned_barcode_copies))
             scan_entry.focus_set()
 
         def chosen_barcode():
@@ -2707,6 +2740,8 @@ class App(tk.Tk):
             try:
                 self.db.link_barcode(barcode, code)
                 session[barcode]['product'] = self.db.resolve_verified_barcode(barcode)
+                if code not in self.in_store:
+                    self.save_store([code], True)
                 display()
                 tree.selection_set(barcode)
                 info.set('Equivalencia verificada y guardada. Podés escanear el siguiente producto.')
@@ -2724,7 +2759,10 @@ class App(tk.Tk):
                     'No se puede preparar una etiqueta sin confirmar la relación código de barras → IdArticulo.', parent=dlg)
                 return
             code = product['code']
+            if code not in self.in_store:
+                self.save_store([code], True)
             self.chosen.add(code)
+            scanned_barcode_copies[barcode] = scanned_barcode_copies.get(barcode, 0) + 1
             scanned_copies[code] = scanned_copies.get(code, 0) + 1
             self.qty[code] = max(self.qty.get(code, 0), scanned_copies[code])
             self._persist_print([code], True)
@@ -2853,7 +2891,7 @@ class App(tk.Tk):
                     w.writerow([type_name,item['new']['code'],item['new']['name'],str(item['old']) if item['old'] is not None else '',str(item['new']['price'])])
         messagebox.showinfo('Exportación completa', f'Archivo guardado en:\n{path}')
 
-    def labels(self, only_codes=None, copies_override=None):
+    def labels(self, only_codes=None, copies_override=None, barcode_counts=None):
         target_codes = set(self.chosen) if only_codes is None else set(only_codes)
         if not target_codes:
             messagebox.showwarning('Seleccioná productos', 'Marcá los productos que quieras imprimir (doble clic o Marcar visibles).'); return
@@ -2884,7 +2922,42 @@ class App(tk.Tk):
                 '.\n\nCompará los listados actuales antes de imprimir. No se genera un precio inventado.')
             return
         qty_source = self.qty if copies_override is None else copies_override
-        copies = sum(qty_source.get(x['new']['code'], 1) for x in selected)
+        # Each physical barcode scanned is printed exactly as received. A SKU may
+        # have several legitimate barcodes, and these must not be merged or guessed.
+        items_to_print = []
+        if barcode_counts is not None:
+            selected_by_code = {x['new']['code']: x for x in selected}
+            for barcode, count in barcode_counts.items():
+                product = self.db.resolve_verified_barcode(barcode)
+                if not product or product['code'] not in selected_by_code:
+                    messagebox.showerror('Código sin verificar',
+                        'No se puede imprimir el código de barras ' + barcode +
+                        ' porque su asociación no está verificada.')
+                    return
+                if count > 0:
+                    items_to_print.append((selected_by_code[product['code']], barcode, int(count)))
+        else:
+            missing_barcodes = []
+            for item in selected:
+                code = item['new']['code']
+                barcode = self.db.verified_barcode_for_label(code)
+                if not barcode:
+                    missing_barcodes.append(code)
+                else:
+                    count = int(qty_source.get(code, 1))
+                    if count > 0:
+                        items_to_print.append((item, barcode, count))
+            if missing_barcodes:
+                messagebox.showerror('Código de barras no confirmado',
+                    'No se imprimirán etiquetas con SKU en lugar del código de barras. '
+                    'Estos artículos no tienen un único código de barras verificado: '
+                    + ', '.join(missing_barcodes[:12]) +
+                    '\n\nEscaneá y verificá el código de barras real antes de imprimir.')
+                return
+        copies = sum(count for _, _, count in items_to_print)
+        if not copies:
+            messagebox.showwarning('Sin etiquetas', 'No hay etiquetas preparadas para imprimir.')
+            return
         if copies > 5000 and not messagebox.askyesno('Muchas etiquetas',f'Se van a generar {copies} etiquetas. ¿Continuar?'): return
         path = filedialog.asksaveasfilename(defaultextension='.pdf', initialfile='etiquetas_cotyland_A4_24.pdf', filetypes=[('PDF','*.pdf')])
         if not path: return
@@ -2922,9 +2995,9 @@ class App(tk.Tk):
             return lines
 
         index = 0
-        for item in sorted(selected, key=lambda x: x['new']['name'].casefold()):
+        for item, barcode, quantity in sorted(items_to_print, key=lambda x: (x[0]['new']['name'].casefold(), x[1])):
             product = item['new']
-            for _ in range(qty_source.get(product['code'], 1)):
+            for _ in range(quantity):
                 if index and index % per_page == 0:
                     c.showPage()
                 slot = index % per_page
@@ -2952,11 +3025,12 @@ class App(tk.Tk):
                 # Línea de precio entre la descripción y el código numérico.
                 c.drawCentredString(x+w/2, y+12.0*mm, price)
 
-                # Código exclusivamente numérico, sin barras ni fuente de barcode.
-                identifier = str(product['code']).strip()
+                # Exact barcode TEXT (including initial zeros and letters), never SKU.
+                # No barcode image; the numeric/alphanumeric identifier is enough.
+                identifier = str(barcode)
                 c.setFont('Helvetica-Bold', 10.0)
                 c.drawCentredString(x+w/2, y+5.1*mm,
-                    clip('Cód. art.: ' + identifier, 'Helvetica-Bold', 10.0, w-4*mm))
+                    clip('Cód. barras: ' + identifier, 'Helvetica-Bold', 10.0, w-4*mm))
                 c.setFont('Helvetica', 7.0)
                 c.drawCentredString(x+w/2, y+1.9*mm, 'Actualizado: ' + generated_date)
                 index += 1
